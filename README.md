@@ -21,6 +21,7 @@ You should create a new user for connecting to plc by typing following into your
 * Tested with:
   * PLC:
   * CPU 1214C DC/DC/DC FW: V4.3
+  * CPU 1214  DC/DC/DC FW: V4.6
   * CPU 1515-2PN FW: V2.6
   * CPU 1513-1PN FW: V2.9
   * Short PLC cycletimes (like 1ms) Will work, but you might have problems manually
@@ -28,7 +29,7 @@ You should create a new user for connecting to plc by typing following into your
         
 * SQL Server:
   * MySql Server: 8.0.26 and 8.0.40
-  * MariaDB Server: 5.5.5 - 10.6.4, 11.2 and 11.5.2
+  * MariaDB Server: 5.5.5 - 10.6.4, 11.2, 11.5.2 and 12.3.2
 
 * Requirements:
   * PLC: S7-1200 or S7-1500
