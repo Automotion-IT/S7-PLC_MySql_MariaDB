@@ -62,6 +62,7 @@ VERSION : 0.1
       Tdiag {InstructionName := 'T_DIAG'; LibVersion := '1.2'} : T_DIAG;   // instance T_DIAG
       Tsend {InstructionName := 'TSEND'; LibVersion := '4.0'} : TSEND;   // instance TSEND
       Trecv {InstructionName := 'TRCV'; LibVersion := '4.0'} : TRCV;   // instance TRCV
+      TrecvTimeout {InstructionName := 'TON_TIME'; LibVersion := '1.0'} : TON_TIME;   // timeout receiving data
       state : Struct   // state data
          Tcon : Struct   // parameter TCON
             done : Bool := FALSE;
@@ -155,6 +156,7 @@ VERSION : 0.1
          up : DInt;   // query data array upper bounds
          "counter" : DInt;   // counter
       END_STRUCT;
+      errTrecvTimeout : Bool;   // timeout receiving data detected
    END_VAR
 
    VAR CONSTANT 
@@ -199,6 +201,7 @@ BEGIN
 	--------------------------------------------------------------------------------------------------------
 	Tested with:
 	    PLC:        CPU 1214C DC/DC/DC FW: V4.3
+	                CPU 1214 DC/DC/DC FW: V4.6
 	                CPU 1515-2PN FW: V2.6
 	                CPU 1513-1PN FW: V2.9
 	                ---------------------
@@ -207,7 +210,7 @@ BEGIN
 	                while debugging live in TIA-Portal (Siemens Software Issue)
 	                ------------------------------------------
 	    Servers:    MySql Server: 8.0.26 and 8.0.40
-	                MariaDB Server: 5.5.5 - 10.6.4, 11.2 and 11.5.2
+	                MariaDB Server: 5.5.5 - 10.6.4, 11.2, 11.5.2 and 12.3.2
 	--------------------------------------------------------------------------------------------------------             
 	Requirements:       
 	    PLC:        S7-1200 or S7-1500                
@@ -250,6 +253,8 @@ BEGIN
 	W#16#0023:  Number of colums in result data is greater than the set value number of columns, adjust the constant "Columns"
 	W#16#0024:  Number of recieved bytes is greater than the set value number of bytes, adjust the constant "Buffersize"
 	W#16#0025:  Number of rows in result data is greater than the set value number of rows, adjust the constant "Rows"
+	W#16#0026:  Timeout receiving data; missing correct footer that indicates the end of data transmission 
+	
 	--------------------------------------------------------------------------------------------------------
 	Server status:
 	-----------------------------------------------------
@@ -414,7 +419,10 @@ BEGIN
 	    #tcpInfo.RemotePort := #remotePort;
 	    #tcpInfo.LocalPort := #localPort;
 	    // split ip-address string to 4 bytes
-	    "SPLIT"(Source := #ipaddress, Seperator := '.',  Destination := #ip.strings, Count := #ip.count);
+	    "SPLIT"(Source := #ipaddress,
+	            Seperator := '.',
+	            Destination := #ip.strings,
+	            Count := #ip.count);
 	    // check if ip-address was detected as 4 strings
 	    IF #ip.count <> 4 THEN
 	        #state.status := W#16#0010;
@@ -440,13 +448,16 @@ BEGIN
 	        ELSE  // Input "server" wrong, 1 = Mysql / 2 = MariaDB
 	            #state.status := W#16#0016;
 	    END_CASE;
-	    SCATTER(IN := #temp."word",  OUT => #clientInfo.CAPABILITIES_STD);
+	    SCATTER(IN := #temp."word",
+	            OUT => #clientInfo.CAPABILITIES_STD);
 	    // set capabilities extended
 	    #temp."word" := W#2#00000000_00001010;
-	    SCATTER(IN := #temp."word", OUT => #clientInfo.CAPABILITIES_EXT);
+	    SCATTER(IN := #temp."word",
+	            OUT => #clientInfo.CAPABILITIES_EXT);
 	    // set capabilities mariaDB
 	    #temp."byte" := B#2#00000000;
-	    SCATTER(IN := #temp."byte", OUT => #clientInfo.CAPABILITIES_MAR);
+	    SCATTER(IN := #temp."byte",
+	            OUT => #clientInfo.CAPABILITIES_MAR);
 	END_REGION
 	REGION TCP connect
 	    // try to establish the tcp connection
@@ -469,7 +480,8 @@ BEGIN
 	END_REGION
 	REGION TCP diagnose of connection
 	    // trigger for diag
-	    #state.Tdiag.trigger(IN := NOT #state.Tdiag.trigger.Q, PT := t#1s);
+	    #state.Tdiag.trigger(IN := NOT #state.Tdiag.trigger.Q,
+	                         PT := t#1s);
 	    
 	    // get tcp connection state
 	    #Tdiag(ID := #tcpInfo.ID,
@@ -520,7 +532,6 @@ BEGIN
 	REGION TCP recieve
 	    IF NOT #state.recieve THEN
 	        #state.Trecv.packetlength := 0;
-	        #state.Trecv.recievedlength := 0;
 	    END_IF;
 	    
 	    // recieve data over tcp
@@ -537,22 +548,15 @@ BEGIN
 	    
 	    IF #state.Trecv.newdata THEN
 	        #retval."int" := MOVE_BLK_VARIANT(SRC := #recvData, COUNT := #state.Trecv.length, SRC_INDEX := 0, DEST_INDEX := #state.Trecv.recievedlength, DEST => #recvBuffer);
-	        #state.Trecv.recievedlength := #state.Trecv.recievedlength + UDINT_TO_DINT(IN:=#state.Trecv.length);
+	        #state.Trecv.recievedlength := #state.Trecv.recievedlength + UDINT_TO_DINT(IN := #state.Trecv.length);
 	        #recvData := #empty.Buffer;
+	        #state.recieved := True;
 	    END_IF;
 	    
-	    // first 4 bytes of a recieved packet is header (3 bytes packet length, 1 byte sequence number)
-	    // if more than 3 bytes are recieved -> read header -> get packet length -> keep Trecv recieving until packet length + 4 (header) recieved
-	    IF #state.Trecv.recievedlength >= 3 THEN
-	        #counter := 0;
-	        // read packet size
-	        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #state.Trecv.packetlength);
-	        #state.Trecv.packetlength := #state.Trecv.packetlength + 4;
-	        // new data completely recieved
-	        IF #state.Trecv.recievedlength >= #state.Trecv.packetlength THEN
-	            #state.recieved := True;
-	        END_IF;
-	    END_IF;
+	    #TrecvTimeout(IN := (#state.step = 85) OR (#state.step = 86),
+	                  PT := t#10s,
+	                  Q => #errTrecvTimeout);
+	    
 	END_REGION
 	REGION Reset status
 	    // reset status if tcp connection is ok
@@ -586,6 +590,7 @@ BEGIN
 	    IF #state.init THEN
 	        #state.init := False;
 	        #state.recieved := False;
+	        #state.Trecv.recievedlength := 0;
 	        #state.sent := False;
 	        #state.tcpConnect := False;
 	        #state.serverConnected := False;
@@ -646,6 +651,7 @@ BEGIN
 	                    #state.recieve := False;
 	                    #state.recieved := False;
 	                    #state.step := 11;
+	                    #state.Trecv.recievedlength := 0;
 	                END_IF;
 	            END_REGION
 	        011: // --> JUMP to 012
@@ -687,39 +693,85 @@ BEGIN
 	                // set array index pointer to 0
 	                #counter := 0;
 	                // read packet size
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 3,
+	                                        Dinteger => #packetInfo.LENGTH);
 	                // read packet number
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1,   Dinteger => #packetInfo.NUMBER);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 1,
+	                                        Dinteger => #packetInfo.NUMBER);
 	                // read protocol version
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #serverInfo.PROTOCOL);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 1,
+	                                        Dinteger => #serverInfo.PROTOCOL);
 	                // read human-readable server version
-	                "READ_NUL_TERMINATED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #serverInfo.VERSION);
+	                "READ_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                             data := #recvBuffer,
+	                                             start := #counter,
+	                                             str => #serverInfo.VERSION);
 	                // read connection id
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 4, Dinteger => #serverInfo.CONNECTION_ID);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 4,
+	                                        Dinteger => #serverInfo.CONNECTION_ID);
 	                // read auth plugin data 1
-	                "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 8, str => #serverInfo.AUTH_PLUGIN_DATA1);
+	                "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                           data := #recvBuffer,
+	                                           start := #counter,
+	                                           bytes := 8,
+	                                           str => #serverInfo.AUTH_PLUGIN_DATA1);
 	                // read filler
 	                #counter += 1;
 	                // read standard server capabilities
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 2,
+	                                        Dinteger => #temp."dint");
 	                #temp."word" := DINT_TO_WORD(#temp."dint");
-	                SCATTER(IN := #temp."word", OUT => #serverInfo.CAPABILITIES_STD);
+	                SCATTER(IN := #temp."word",
+	                        OUT => #serverInfo.CAPABILITIES_STD);
 	                // if more data in handshake (packet length > actual index counter)
 	                IF #packetInfo.LENGTH > #counter - 1 THEN
 	                    // read server language
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #serverInfo.COLLATION);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #serverInfo.COLLATION);
 	                    // read server status
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 2,
+	                                            Dinteger => #temp."dint");
 	                    #temp."word" := DINT_TO_WORD(#temp."dint");
-	                    SCATTER(IN := #temp."word", OUT => #serverInfo.STATUS);
+	                    SCATTER(IN := #temp."word",
+	                            OUT => #serverInfo.STATUS);
 	                    // read extended server capabilities
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 2,
+	                                            Dinteger => #temp."dint");
 	                    #temp."word" := DINT_TO_WORD(#temp."dint");
-	                    SCATTER(IN := #temp."word", OUT => #serverInfo.CAPABILITIES_EXT);
+	                    SCATTER(IN := #temp."word",
+	                            OUT => #serverInfo.CAPABILITIES_EXT);
 	                    // if capability flag PLUGIN_AUTH is set on server
 	                    IF #serverInfo.CAPABILITIES_EXT.PLUGIN_AUTH THEN
 	                        // read authentication plugin length
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #serverInfo.AUTH_PLUGIN_LENGTH);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 1,
+	                                                Dinteger => #serverInfo.AUTH_PLUGIN_LENGTH);
 	                    ELSE
 	                        // read filler 
 	                        #counter += 1;
@@ -732,23 +784,35 @@ BEGIN
 	                        #counter += 4;
 	                    ELSE
 	                        // read mariadb extended server capabilities
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 4, Dinteger => #temp."dint");
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 4,
+	                                                Dinteger => #temp."dint");
 	                        #temp."byte" := DINT_TO_BYTE(#temp."dint");
-	                        SCATTER(IN := #temp."byte", OUT => #serverInfo.CAPABILITIES_MAR);
+	                        SCATTER(IN := #temp."byte",
+	                                OUT => #serverInfo.CAPABILITIES_MAR);
 	                    END_IF;
 	                    // if capability flag AUTH_PROTOCOL_41 is set on server
 	                    IF #serverInfo.CAPABILITIES_STD.AUTH_PROTOCOL_41 THEN
 	                        // set length to a minimum of 12
 	                        #temp."int" := MAX(IN1 := 12, IN2 := DINT_TO_INT(#serverInfo.AUTH_PLUGIN_LENGTH - 9));
 	                        // read auth plugin data 2
-	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := #temp."int", str => #serverInfo.AUTH_PLUGIN_DATA2);
+	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                   data := #recvBuffer,
+	                                                   start := #counter,
+	                                                   bytes := #temp."int",
+	                                                   str => #serverInfo.AUTH_PLUGIN_DATA2);
 	                        // read filler
 	                        #counter += 1;
 	                    END_IF;
 	                    // if capability flag PLUGIN_AUTH is set on server
 	                    IF #serverInfo.CAPABILITIES_EXT.PLUGIN_AUTH THEN
 	                        // read authentication plugin name
-	                        "READ_NUL_TERMINATED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #serverInfo.AUTH_PLUGIN_NAME);
+	                        "READ_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #serverInfo.AUTH_PLUGIN_NAME);
 	                    END_IF;
 	                END_IF;
 	                #state.step := 12;
@@ -757,20 +821,29 @@ BEGIN
 	            REGION Align capabilities
 	                // Align server and client capabilities
 	                // standard capabilities
-	                GATHER(IN := #serverInfo.CAPABILITIES_STD, OUT => #temp."word");
-	                GATHER(IN := #clientInfo.CAPABILITIES_STD, OUT => #temp."word2");
+	                GATHER(IN := #serverInfo.CAPABILITIES_STD,
+	                       OUT => #temp."word");
+	                GATHER(IN := #clientInfo.CAPABILITIES_STD,
+	                       OUT => #temp."word2");
 	                #temp."word" := #temp."word" AND #temp.word2;
-	                SCATTER(IN := #temp."word", OUT => #capabilities.standard);
+	                SCATTER(IN := #temp."word",
+	                        OUT => #capabilities.standard);
 	                // extended capabilities
-	                GATHER(IN := #serverInfo.CAPABILITIES_EXT, OUT => #temp."word");
-	                GATHER(IN := #clientInfo.CAPABILITIES_EXT, OUT => #temp."word2");
+	                GATHER(IN := #serverInfo.CAPABILITIES_EXT,
+	                       OUT => #temp."word");
+	                GATHER(IN := #clientInfo.CAPABILITIES_EXT,
+	                       OUT => #temp."word2");
 	                #temp."word" := #temp."word" AND #temp.word2;
-	                SCATTER(IN := #temp."word", OUT => #capabilities.extended);
+	                SCATTER(IN := #temp."word",
+	                        OUT => #capabilities.extended);
 	                // mariadb capabilities
-	                GATHER(IN := #serverInfo.CAPABILITIES_MAR, OUT => #temp."byte");
-	                GATHER(IN := #clientInfo.CAPABILITIES_MAR, OUT => #temp."byte2");
+	                GATHER(IN := #serverInfo.CAPABILITIES_MAR,
+	                       OUT => #temp."byte");
+	                GATHER(IN := #clientInfo.CAPABILITIES_MAR,
+	                       OUT => #temp."byte2");
 	                #temp."byte" := #temp."byte" AND #temp.byte2;
-	                SCATTER(IN := #temp."byte", OUT => #capabilities.mariadb);
+	                SCATTER(IN := #temp."byte",
+	                        OUT => #capabilities.mariadb);
 	                #state.step := 13;
 	            END_REGION
 	        013: // --> JUMP to 014
@@ -780,13 +853,19 @@ BEGIN
 	                //---------------------------------------------------------------------
 	                #clientInfo.AUTH_PLUGIN_RESPONSE := '';
 	                // SHA1(password)
-	                "SHA1"(message := #clientInfo.PASSWORD, hexdigest => #temp."string", digest => #sha1.left);
+	                "SHA1"(message := #clientInfo.PASSWORD,
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.left);
 	                // "20-bytes random data from server" <concat> SHA1(SHA1(password))
-	                "SHA1"(message := #sha1.left, hexdigest => #temp."string", digest => #sha1.right);
+	                "SHA1"(message := #sha1.left,
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.right);
 	                #temp."string" := CONCAT_STRING(IN1 := #serverInfo.AUTH_PLUGIN_DATA1, IN2 := #serverInfo.AUTH_PLUGIN_DATA2);
 	                #temp."string" := CONCAT_STRING(IN1 := #temp."string", IN2 := #sha1.right);
 	                // SHA1("20-bytes random data from server" <concat> SHA1(SHA1(password)))
-	                "SHA1"(message := #temp."string", hexdigest => #temp."string", digest => #sha1.right);
+	                "SHA1"(message := #temp."string",
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.right);
 	                // XOR every Byte form string
 	                FOR #sha1.counter := 1 TO MIN(IN1 := LEN(#sha1.left), IN2 := LEN(#sha1.right)) DO
 	                    // XOR
@@ -835,52 +914,106 @@ BEGIN
 	                // set array index pointer to 4 (0-3 = Packet length and number) 
 	                #counter := 4;
 	                // write standard client capabilities
-	                GATHER(IN := #clientInfo.CAPABILITIES_STD, OUT => #temp."word");
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 2, Dinteger := #temp."word");
+	                GATHER(IN := #clientInfo.CAPABILITIES_STD,
+	                       OUT => #temp."word");
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 2,
+	                                             Dinteger := #temp."word");
 	                // write extended client capabilities
-	                GATHER(IN := #clientInfo.CAPABILITIES_EXT, OUT => #temp."word");
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 2, Dinteger := #temp."word");
+	                GATHER(IN := #clientInfo.CAPABILITIES_EXT,
+	                       OUT => #temp."word");
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 2,
+	                                             Dinteger := #temp."word");
 	                // write max-packet size
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 4, Dinteger := #clientInfo.MAX_PACKET_SIZE);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 4,
+	                                             Dinteger := #clientInfo.MAX_PACKET_SIZE);
 	                // write client language
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #clientInfo.COLLATION);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := #clientInfo.COLLATION);
 	                // write filler 19 byte B#16#00 (char $00)
-	                "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 19, str := '');
+	                "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                            data := #sendBuffer,
+	                                            start := #counter,
+	                                            bytes := 19,
+	                                            str := '');
 	                // if capability flag CLIENT_MYSQL is set on server and client
 	                IF #capabilities.standard.CLIENT_MYSQL THEN
 	                    // write filler
-	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 4, str := '');
+	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                data := #sendBuffer,
+	                                                start := #counter,
+	                                                bytes := 4,
+	                                                str := '');
 	                ELSE
 	                    // write mariadb extended server capabilities
-	                    GATHER(IN := #clientInfo.CAPABILITIES_MAR, OUT => #temp."byte");
-	                    "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 4, Dinteger := #temp."byte");
+	                    GATHER(IN := #clientInfo.CAPABILITIES_MAR,
+	                           OUT => #temp."byte");
+	                    "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                                 data := #sendBuffer,
+	                                                 start := #counter,
+	                                                 bytes := 4,
+	                                                 Dinteger := #temp."byte");
 	                END_IF;
 	                // write username
-	                "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, str := #clientInfo.USERNAME);
+	                "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                              data := #sendBuffer,
+	                                              start := #counter,
+	                                              str := #clientInfo.USERNAME);
 	                // if capability flag PLUGIN_AUTH_LENENC is set on server and client
 	                IF #capabilities.extended.PLUGIN_AUTH_LENENC THEN
 	                    // write auth-response
-	                    "WRITE_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, str := #clientInfo.AUTH_PLUGIN_RESPONSE);
+	                    "WRITE_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                  data := #sendBuffer,
+	                                                  start := #counter,
+	                                                  str := #clientInfo.AUTH_PLUGIN_RESPONSE);
 	                    // if capability flag AUTH_PROTOCOL_41 is set on server and client
 	                ELSIF #capabilities.standard.AUTH_PROTOCOL_41 THEN
 	                    // write auth-response length
 	                    #temp."int" := LEN(#clientInfo.AUTH_PLUGIN_RESPONSE);
-	                    "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #temp."int");
+	                    "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                                 data := #sendBuffer,
+	                                                 start := #counter,
+	                                                 bytes := 1,
+	                                                 Dinteger := #temp."int");
 	                    // write auth-response
-	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := #temp."int", str := #clientInfo.AUTH_PLUGIN_RESPONSE);
+	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                data := #sendBuffer,
+	                                                start := #counter,
+	                                                bytes := #temp."int",
+	                                                str := #clientInfo.AUTH_PLUGIN_RESPONSE);
 	                ELSE
 	                    // write auth-response
-	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, str := #clientInfo.AUTH_PLUGIN_RESPONSE);
+	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                                  data := #sendBuffer,
+	                                                  start := #counter,
+	                                                  str := #clientInfo.AUTH_PLUGIN_RESPONSE);
 	                END_IF;
 	                // if capability flag CONNECT_WITH_DB is set on server and client
 	                IF #capabilities.standard.CONNECT_WITH_DB THEN
 	                    // write database
-	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, str := #clientInfo.DATABASE);
+	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                                  data := #sendBuffer,
+	                                                  start := #counter,
+	                                                  str := #clientInfo.DATABASE);
 	                END_IF;
 	                // if capability flag PLUGIN_AUTH is set on server and client
 	                IF #capabilities.extended.PLUGIN_AUTH THEN
 	                    // write authentication plugin name
-	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, str := #clientInfo.AUTH_PLUGIN_NAME);
+	                    "WRITE_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                                  data := #sendBuffer,
+	                                                  start := #counter,
+	                                                  str := #clientInfo.AUTH_PLUGIN_NAME);
 	                END_IF;
 	                // if capability flag CONNECT_ATTRS is set on server and client
 	                IF #capabilities.extended.CONNECT_ATTRS THEN
@@ -891,10 +1024,18 @@ BEGIN
 	                #packetInfo.LENGTH := #counter - 4;
 	                #counter := 0;
 	                // write packet length
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 3, Dinteger := #packetInfo.LENGTH);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 3,
+	                                             Dinteger := #packetInfo.LENGTH);
 	                // write packet number
 	                #packetInfo.NUMBER += 1;
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #packetInfo.NUMBER);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := #packetInfo.NUMBER);
 	                #state.step := 50;
 	            END_REGION
 	        020: // --> JUMP to 050
@@ -913,15 +1054,27 @@ BEGIN
 	                // set array index pointer to 4 (0-3 = Packet length and number) 
 	                #counter := 4;
 	                // write ping header
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := B#16#0e);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := B#16#0e);
 	                // calculate packet length (packet length = number of bytes - bytes(packet length data) - bytes(packet number data)
 	                #packetInfo.LENGTH := #counter - 4;
 	                #counter := 0;
 	                // write packet length
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 3, Dinteger := #packetInfo.LENGTH);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 3,
+	                                             Dinteger := #packetInfo.LENGTH);
 	                // write packet number
 	                #packetInfo.NUMBER := 0;
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #packetInfo.NUMBER);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := #packetInfo.NUMBER);
 	                #state.step := 50;
 	            END_REGION
 	        030: // --> JUMP to 050
@@ -941,23 +1094,39 @@ BEGIN
 	                // set array index pointer to 4 (0-3 = Packet length and number) 
 	                #counter := 4;
 	                // write ping header
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := B#16#03);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := B#16#03);
 	                // write sql statement from array
 	                // get array bounds
 	                #querystatement.low := LOWER_BOUND(ARR := #querydata, DIM := 1);
 	                #querystatement.up := UPPER_BOUND(ARR := #querydata, DIM := 1);
 	                FOR #querystatement.counter := #querystatement.low TO #querystatement.up DO
 	                    #temp."string" := #querydata[#querystatement.counter];
-	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := LEN(#temp."string"), str := #temp."string");
+	                    "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                data := #sendBuffer,
+	                                                start := #counter,
+	                                                bytes := LEN(#temp."string"),
+	                                                str := #temp."string");
 	                END_FOR;
 	                // calculate packet length (packet length = number of bytes - bytes(packet length data) - bytes(packet number data)
 	                #packetInfo.LENGTH := #counter - 4;
 	                #counter := 0;
 	                // write packet length
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 3, Dinteger := #packetInfo.LENGTH);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 3,
+	                                             Dinteger := #packetInfo.LENGTH);
 	                // write packet number
 	                #packetInfo.NUMBER := 0;
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #packetInfo.NUMBER);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := #packetInfo.NUMBER);
 	                #state.step := 50;
 	            END_REGION
 	        050: // --> JUMP to 051
@@ -970,6 +1139,9 @@ BEGIN
 	                    #state.step := 51;
 	                    // delete recieve buffer
 	                    #recvBuffer := #empty.Buffer;
+	                    // init recieved length info                    
+	                    #state.Trecv.recievedlength := 0;
+	                    #state.recieved := false;
 	                END_IF;
 	            END_REGION
 	        051: // --> JUMP to 052
@@ -992,16 +1164,28 @@ BEGIN
 	                // set array index pointer to 0
 	                #counter := 0;
 	                // read packet size
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 3,
+	                                        Dinteger => #packetInfo.LENGTH);
 	                // check if number of recieved bytes is to much
 	                IF #state.Trecv.recievedlength >= #Buffersize THEN
 	                    // number of recieved bytes is greater than the set value number of bytes, adjust the constant "Buffersize"
 	                    #state.status := W#16#0024;
 	                END_IF;
 	                // read packet number
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #packetInfo.NUMBER);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 1,
+	                                        Dinteger => #packetInfo.NUMBER);
 	                // check packet type
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #temp."dint");
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 1,
+	                                        Dinteger => #temp."dint");
 	                #packetInfo.TYPE := DINT_TO_BYTE(#temp."dint");
 	                IF #packetInfo.TYPE = B#16#00 THEN // OK packet
 	                    #state.step := 60;
@@ -1013,7 +1197,7 @@ BEGIN
 	                    #state.step := 80;
 	                ELSE // RESULT packet or UNKNOWN packet
 	                    IF #query THEN // RESULT packet
-	                        #state.step := 90;
+	                        #state.step := 85;
 	                    ELSE // UNKNOWN packet
 	                        #state.status := W#16#0020;
 	                    END_IF;
@@ -1039,15 +1223,30 @@ BEGIN
 	               ----------------------------------------------------------------------------
 	                *)
 	                // read affected rows
-	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool", data := #recvBuffer, start := #counter, Dinteger => #okPacket.AFFECTED_ROWS);
+	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool",
+	                                              data := #recvBuffer,
+	                                              start := #counter,
+	                                              Dinteger => #okPacket.AFFECTED_ROWS);
 	                // read last insert id
-	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool", data := #recvBuffer, start := #counter, Dinteger => #okPacket.LAST_INSERT_ID);
+	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool",
+	                                              data := #recvBuffer,
+	                                              start := #counter,
+	                                              Dinteger => #okPacket.LAST_INSERT_ID);
 	                // read server status
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 2,
+	                                        Dinteger => #temp."dint");
 	                #temp."word" := DINT_TO_WORD(#temp."dint");
-	                SCATTER(IN := #temp."word", OUT => #serverInfo.STATUS);
+	                SCATTER(IN := #temp."word",
+	                        OUT => #serverInfo.STATUS);
 	                // read warning count
-	                "READ_FIXED_LENGTH_INT"(data := #recvBuffer, error => #retval."bool", start := #counter, bytes := 2, Dinteger => #okPacket.WARNING_COUNT);
+	                "READ_FIXED_LENGTH_INT"(data := #recvBuffer,
+	                                        error => #retval."bool",
+	                                        start := #counter,
+	                                        bytes := 2,
+	                                        Dinteger => #okPacket.WARNING_COUNT);
 	                // if capability flag SESSION_TRACK is set on server and client
 	                IF #capabilities.extended.SESSION_TRACK THEN
 	                    // client capability "SESSION_TRACK" is set, but it is not implemented
@@ -1068,9 +1267,16 @@ BEGIN
 	                ------------------------------------------------------
 	                *)
 	                // read authentication plugin name
-	                "READ_NUL_TERMINATED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #authPacket.AUTH_PLUGIN_NAME);
+	                "READ_NUL_TERMINATED_STRING"(error => #retval."bool",
+	                                             data := #recvBuffer,
+	                                             start := #counter,
+	                                             str => #authPacket.AUTH_PLUGIN_NAME);
 	                // read authentication plugin data (rest of packet)
-	                "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 20, str => #authPacket.AUTH_PLUGIN_DATA);
+	                "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                           data := #recvBuffer,
+	                                           start := #counter,
+	                                           bytes := 20,
+	                                           str => #authPacket.AUTH_PLUGIN_DATA);
 	                // wich authentication method will be used?
 	                IF #authPacket.AUTH_PLUGIN_NAME = 'caching_sha2_password' THEN
 	                    #state.step := 071;
@@ -1090,12 +1296,18 @@ BEGIN
 	                //---------------------------------------------------------------------
 	                #authPacket.AUTH_PLUGIN_RESPONSE := '';
 	                // SHA1(password)
-	                "SHA1"(message := #clientInfo.PASSWORD, hexdigest => #temp."string", digest => #sha1.left);
+	                "SHA1"(message := #clientInfo.PASSWORD,
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.left);
 	                // "20-bytes random data from server" <concat> SHA1(SHA1(password))
-	                "SHA1"(message := #sha1.left, hexdigest => #temp."string", digest => #sha1.right);
+	                "SHA1"(message := #sha1.left,
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.right);
 	                #temp."string" := CONCAT_STRING(IN1 := #authPacket.AUTH_PLUGIN_DATA, IN2 := #sha1.right);
 	                // SHA1("20-bytes random data from server" <concat> SHA1(SHA1(password)))
-	                "SHA1"(message := #temp."string", hexdigest => #temp."string", digest => #sha1.right);
+	                "SHA1"(message := #temp."string",
+	                       hexdigest => #temp."string",
+	                       digest => #sha1.right);
 	                // XOR every Byte form string
 	                FOR #sha1.counter := 1 TO MIN(IN1 := LEN(#sha1.left), IN2 := LEN(#sha1.right)) DO
 	                    // XOR
@@ -1119,15 +1331,27 @@ BEGIN
 	                // set array index pointer to 4 (0-3 = Packet length and number) 
 	                #counter := 4;
 	                // write auth-response
-	                "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := LEN(#authPacket.AUTH_PLUGIN_RESPONSE), str := #authPacket.AUTH_PLUGIN_RESPONSE);
+	                "WRITE_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                            data := #sendBuffer,
+	                                            start := #counter,
+	                                            bytes := LEN(#authPacket.AUTH_PLUGIN_RESPONSE),
+	                                            str := #authPacket.AUTH_PLUGIN_RESPONSE);
 	                // calculate packet length (packet length = number of bytes - bytes(packet length data) - bytes(packet number data)
 	                #packetInfo.LENGTH := #counter - 4;
 	                #counter := 0;
 	                // write packet length
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 3, Dinteger := #packetInfo.LENGTH);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 3,
+	                                             Dinteger := #packetInfo.LENGTH);
 	                // write packet number
 	                #packetInfo.NUMBER += 1;
-	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool", data := #sendBuffer, start := #counter, bytes := 1, Dinteger := #packetInfo.NUMBER);
+	                "WRITE_FIXED_LENGTH_INTEGER"(error => #retval."bool",
+	                                             data := #sendBuffer,
+	                                             start := #counter,
+	                                             bytes := 1,
+	                                             Dinteger := #packetInfo.NUMBER);
 	                #state.step := 50;
 	            END_REGION
 	        080: // --> JUMP to 000
@@ -1154,32 +1378,115 @@ BEGIN
 	                ------------------------------------------------
 	                *)
 	                // read error code
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #errorPacket.ERROR_CODE);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 2,
+	                                        Dinteger => #errorPacket.ERROR_CODE);
 	                // if (error code == 0xFFFF) --> progress reporting
 	                IF #errorPacket.ERROR_CODE = W#16#FFFF THEN
 	                    // read error stage
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #errorPacket.STAGE);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #errorPacket.STAGE);
 	                    // read error max stage
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #errorPacket.MAX_STAGE);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #errorPacket.MAX_STAGE);
 	                    // read error progress
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #errorPacket.PROGRESS);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 3,
+	                                            Dinteger => #errorPacket.PROGRESS);
 	                    // read error progress info
-	                    "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #errorPacket.PROGRESS_INFO);
+	                    "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                 data := #recvBuffer,
+	                                                 start := #counter,
+	                                                 str => #errorPacket.PROGRESS_INFO);
 	                    // if (next byte = '#')    
 	                ELSE
 	                    IF BYTE_TO_CHAR(#recvBuffer[#counter]) = '#' THEN
 	                        // read sql state marker
-	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, str => #errorPacket.SQL_STATE_MARKER);
+	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                   data := #recvBuffer,
+	                                                   start := #counter,
+	                                                   bytes := 1,
+	                                                   str => #errorPacket.SQL_STATE_MARKER);
 	                        // read sql state
-	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 5, str => #errorPacket.SQL_STATE);
+	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                   data := #recvBuffer,
+	                                                   start := #counter,
+	                                                   bytes := 5,
+	                                                   str => #errorPacket.SQL_STATE);
 	                        // read error message (rest of packet)
-	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := DINT_TO_INT(#packetInfo.LENGTH) + 4 - #counter, str => #errorPacket.ERROR_MESSAGE);
+	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                   data := #recvBuffer,
+	                                                   start := #counter,
+	                                                   bytes := DINT_TO_INT(#packetInfo.LENGTH) + 4 - #counter,
+	                                                   str => #errorPacket.ERROR_MESSAGE);
 	                    ELSE
 	                        // read error message (rest of packet)
-	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := DINT_TO_INT(#packetInfo.LENGTH) + 4 - #counter, str => #errorPacket.ERROR_MESSAGE);
+	                        "READ_FIXED_LENGTH_STRING"(error => #retval."bool",
+	                                                   data := #recvBuffer,
+	                                                   start := #counter,
+	                                                   bytes := DINT_TO_INT(#packetInfo.LENGTH) + 4 - #counter,
+	                                                   str => #errorPacket.ERROR_MESSAGE);
 	                    END_IF;
 	                END_IF;
 	                #state.status := W#16#0012;
+	            END_REGION
+	        085: // --> JUMP TO 086, 090
+	            REGION Check received complete
+	                IF #state.Trecv.recievedlength >= 9 THEN
+	                    #counter := DINT_TO_INT(#state.Trecv.recievedlength) - 9;
+	                    // read packet size
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 3,
+	                                            Dinteger => #packetInfo.LENGTH);
+	                    // read packet number
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #packetInfo.NUMBER);
+	                    // read packet header
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #temp."dint");
+	                    #packetInfo.TYPE := DINT_TO_BYTE(#temp."dint");
+	                    // check packet type
+	                    IF #packetInfo.TYPE = B#16#fe AND #packetInfo.LENGTH = 5 AND NOT #capabilities.extended.DEPRECATE_EOF THEN
+	                        // received data is complete
+	                        #state.step := 90;
+	                    ELSE
+	                        // received data is not complete, wait for more data
+	                        #state.recieve := true;
+	                        #state.step := 86;
+	                    END_IF;
+	                END_IF;
+	            END_REGION
+	        086: // --> JUMP TO 085
+	            REGION Recieve more data
+	                // timeout recieving following data
+	                IF #errTrecvTimeout THEN
+	                    #state.status := w#16#0026;
+	                END_IF;
+	                // check, if new data recieved
+	                IF #state.recieved THEN
+	                    #state.recieve := false;
+	                    #state.recieved := false;
+	                    // check recieved data
+	                    #state.step := 85;
+	                END_IF;
 	            END_REGION
 	        090: // --> JUMP to 060, 070, 0100
 	            REGION Read RESULT packet
@@ -1242,11 +1549,22 @@ BEGIN
 	                #nRows := 0;
 	                #nColumns := 0;
 	                // read packet size
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 3,
+	                                        Dinteger => #packetInfo.LENGTH);
 	                // read packet number
-	                "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #packetInfo.NUMBER);
+	                "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                        data := #recvBuffer,
+	                                        start := #counter,
+	                                        bytes := 1,
+	                                        Dinteger => #packetInfo.NUMBER);
 	                // read column count
-	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool", data := #recvBuffer, start := #counter, Dinteger => #nColumns);
+	                "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool",
+	                                              data := #recvBuffer,
+	                                              start := #counter,
+	                                              Dinteger => #nColumns);
 	                #state.step := 80;
 	                // check if number of colums is bigger than max colums setting
 	                IF #nColumns > #Columns THEN
@@ -1261,21 +1579,47 @@ BEGIN
 	                    // read columndata for each column
 	                    FOR #column.counter := 1 TO #nColumns DO
 	                        // read packet size
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 3,
+	                                                Dinteger => #packetInfo.LENGTH);
 	                        // read packet number
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #packetInfo.NUMBER);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 1,
+	                                                Dinteger => #packetInfo.NUMBER);
 	                        // read catalog
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.CATALOG);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.CATALOG);
 	                        // read schema
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.SCHEMA);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.SCHEMA);
 	                        // read table alias
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.TABLE_ALIAS);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.TABLE_ALIAS);
 	                        // read table
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.TABLE);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.TABLE);
 	                        // read column alias
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.COLUMN_ALIAS);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.COLUMN_ALIAS);
 	                        // read column
-	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #column.Info.COLUMN);
+	                        "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                     data := #recvBuffer,
+	                                                     start := #counter,
+	                                                     str => #column.Info.COLUMN);
 	                        // save column name
 	                        #resultData[#column.counter, 0] := #column.Info.COLUMN;
 	                        // if capability flag CLIENT_EXTENDED_TYPE_INFO is set on server and client
@@ -1284,19 +1628,43 @@ BEGIN
 	                            #state.status := W#16#0015;
 	                        END_IF;
 	                        // read length of fixed fields
-	                        "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool", data := #recvBuffer, start := #counter, Dinteger => #column.Info.LENGTH_FIXED_FIELDS);
+	                        "READ_LENGTH_ENCODED_INTEGER"(error => #retval."bool",
+	                                                      data := #recvBuffer,
+	                                                      start := #counter,
+	                                                      Dinteger => #column.Info.LENGTH_FIXED_FIELDS);
 	                        // read result language
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #column.Info.COLLATION);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 2,
+	                                                Dinteger => #column.Info.COLLATION);
 	                        // read max column size
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 4, Dinteger => #column.Info.MAX_SIZE);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 4,
+	                                                Dinteger => #column.Info.MAX_SIZE);
 	                        // read field types
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #column.Info.FIELD_TYPES);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 1,
+	                                                Dinteger => #column.Info.FIELD_TYPES);
 	                        // read field flags
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #column.Info.FIELD_DETAIL_FLAG);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 2,
+	                                                Dinteger => #column.Info.FIELD_DETAIL_FLAG);
 	                        #temp."word" := DINT_TO_WORD(#column.Info.FIELD_DETAIL_FLAG);
-	                        SCATTER(IN := #temp."word", OUT => #column.Info.FIELD_FLAGS);
+	                        SCATTER(IN := #temp."word",
+	                                OUT => #column.Info.FIELD_FLAGS);
 	                        // read decimals
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #column.Info.DECIMALS);
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 1,
+	                                                Dinteger => #column.Info.DECIMALS);
 	                        // read filler
 	                        #counter += 2;
 	                    END_FOR;
@@ -1304,26 +1672,59 @@ BEGIN
 	                // if not capability flag DEPRECATE_EOF is set on server and client
 	                IF NOT #capabilities.extended.DEPRECATE_EOF THEN
 	                    // read packet size
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 3,
+	                                            Dinteger => #packetInfo.LENGTH);
 	                    // read packet number
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #packetInfo.NUMBER);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #packetInfo.NUMBER);
 	                    // read eof packet header
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #temp."dint");
 	                    // read warning count
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 2,
+	                                            Dinteger => #temp."dint");
 	                    // read server status
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 2,
+	                                            Dinteger => #temp."dint");
 	                    #temp."word" := DINT_TO_WORD(#temp."dint");
-	                    SCATTER(IN := #temp."word", OUT => #serverInfo.STATUS);
+	                    SCATTER(IN := #temp."word",
+	                            OUT => #serverInfo.STATUS);
 	                END_IF;
 	                // read row data until the next eof packet is found, this is indicated by a packet length of 5 and a header byte with B#16#fe
 	                WHILE #counter < #Buffersize DO
 	                    // read packet size
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 3, Dinteger => #packetInfo.LENGTH);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 3,
+	                                            Dinteger => #packetInfo.LENGTH);
 	                    // read packet number
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #packetInfo.NUMBER);
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #packetInfo.NUMBER);
 	                    // read packet header
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 1, Dinteger => #temp."dint");
+	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                            data := #recvBuffer,
+	                                            start := #counter,
+	                                            bytes := 1,
+	                                            Dinteger => #temp."dint");
 	                    #packetInfo.TYPE := DINT_TO_BYTE(#temp."dint");
 	                    // check packet type
 	                    IF #packetInfo.TYPE = B#16#00 AND #capabilities.extended.DEPRECATE_EOF THEN
@@ -1338,11 +1739,20 @@ BEGIN
 	                        EXIT;
 	                    ELSIF #packetInfo.TYPE = B#16#fe AND #packetInfo.LENGTH = 5 AND NOT #capabilities.extended.DEPRECATE_EOF THEN
 	                        // read warning count
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 2,
+	                                                Dinteger => #temp."dint");
 	                        // read server status
-	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool", data := #recvBuffer, start := #counter, bytes := 2, Dinteger => #temp."dint");
+	                        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                                data := #recvBuffer,
+	                                                start := #counter,
+	                                                bytes := 2,
+	                                                Dinteger => #temp."dint");
 	                        #temp."word" := DINT_TO_WORD(#temp."dint");
-	                        SCATTER(IN := #temp."word", OUT => #serverInfo.STATUS);
+	                        SCATTER(IN := #temp."word",
+	                                OUT => #serverInfo.STATUS);
 	                        // result completely read
 	                        #state.step := 100;
 	                        // exit loop
@@ -1369,7 +1779,10 @@ BEGIN
 	                                #temp."string" := 'NULL';
 	                                #counter += 1;
 	                            ELSE
-	                                "READ_LENGTH_ENCODED_STRING"(error => #retval."bool", data := #recvBuffer, start := #counter, str => #temp."string");
+	                                "READ_LENGTH_ENCODED_STRING"(error => #retval."bool",
+	                                                             data := #recvBuffer,
+	                                                             start := #counter,
+	                                                             str => #temp."string");
 	                            END_IF;
 	                            #resultData[#column.counter, #nRows] := #temp."string";
 	                        END_FOR;
