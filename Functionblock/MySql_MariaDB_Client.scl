@@ -33,6 +33,7 @@ VERSION : 0.1
       nColumns : DInt := 0;   // number of recieved columns
       nRows : DInt := 0;   // number of recieved rows
       resultData : Array[1..#Columns, 0..#Rows] of String[#Stringsize];   // resultdata: ResultData[1,0] = Columnname | ResultData[1,1-X] = Rowdata
+      error : Bool := FALSE;   // status is an error code (16#0010 or higher)
    END_VAR
 
    VAR_IN_OUT 
@@ -248,12 +249,13 @@ BEGIN
 	            3.    ALTER USER 'your_new_username'@'%' IDENTIFIED BY 'your_new_password';
 	            4.    GRANT ALL PRIVILEGES ON your_databasename.your_tablename TO 'your_new_username'@'%';
 	            5.    FLUSH PRIVILEGES;  
+	W#16#0018:  Ping or query requested while the client is not connected
 	W#16#0020:  Wrong packet type recieved after login request, expectet OK or ERROR
 	W#16#0021:  Recieved LOCALINFILE packet, but it is not implemented
 	W#16#0023:  Number of colums in result data is greater than the set value number of columns, adjust the constant "Columns"
 	W#16#0024:  Number of recieved bytes is greater than the set value number of bytes, adjust the constant "Buffersize"
 	W#16#0025:  Number of rows in result data is greater than the set value number of rows, adjust the constant "Rows"
-	W#16#0026:  Timeout receiving data; missing correct footer that indicates the end of data transmission 
+	W#16#0026:  Timeout receiving data; server message incomplete (split TCP data, or missing end of the result) 
 	
 	--------------------------------------------------------------------------------------------------------
 	Server status:
@@ -492,19 +494,21 @@ BEGIN
 	           STATUS => #state.Tdiag.status,
 	           RESULT := #state.Tdiag.result);
 	    
-	    // check if the tcp connection is established
-	    IF #state.Tdiag.done THEN
-	        IF #state.Tdiag.result.State = B#16#4 THEN
-	            #state.tcpConnected := True;
-	        ELSE
-	            #state.tcpConnected := False;
-	        END_IF;
-	    ELSIF #state.Tdiag.error THEN
-	        #state.tcpConnected := False;
+	    // TCON DONE means the TCP session is up. The server sends the greeting at that moment.
+	    // Do not wait for the next T_DIAG sample before reading it.
+	    IF #state.Tcon.done THEN
+	        #state.tcpConnected := TRUE;
+	    END_IF;
+	    IF #state.Tcon.error OR #state.Tdiag.error OR #state.Tdiscon.done THEN
+	        #state.tcpConnected := FALSE;
+	    END_IF;
+	    // T_DIAG state 4 confirms the session is still up
+	    IF #state.Tdiag.done AND (#state.Tdiag.result.State = B#16#4) THEN
+	        #state.tcpConnected := TRUE;
 	    END_IF;
 	    
 	    // write status if tcp connection is not established
-	    IF #state.tcpConnect AND #state.Tdiag.result.State <> B#16#4 THEN
+	    IF #state.tcpConnect AND (#state.Tdiag.result.State <> B#16#4) AND (#state.status < W#16#0010) THEN
 	        #state.status := W#16#0002;
 	    END_IF;
 	    
@@ -530,10 +534,6 @@ BEGIN
 	    END_IF;
 	END_REGION
 	REGION TCP recieve
-	    IF NOT #state.recieve THEN
-	        #state.Trecv.packetlength := 0;
-	    END_IF;
-	    
 	    // recieve data over tcp
 	    #Trecv(EN_R := #state.recieve,
 	           ID := #tcpInfo.ID,
@@ -546,14 +546,209 @@ BEGIN
 	           RCVD_LEN => #state.Trecv.length,
 	           DATA := #recvData);
 	    
-	    IF #state.Trecv.newdata THEN
-	        #retval."int" := MOVE_BLK_VARIANT(SRC := #recvData, COUNT := #state.Trecv.length, SRC_INDEX := 0, DEST_INDEX := #state.Trecv.recievedlength, DEST => #recvBuffer);
-	        #state.Trecv.recievedlength := #state.Trecv.recievedlength + UDINT_TO_DINT(IN := #state.Trecv.length);
-	        #recvData := #empty.Buffer;
-	        #state.recieved := True;
+	    // Append the next TCP fragment. One fragment is not a MySQL message:
+	    // TRCV with ADHOC can deliver a zero-length NDR or only part of a packet.
+	    IF #state.Trecv.newdata AND (#state.Trecv.length > 0) THEN
+	        IF (#state.Trecv.recievedlength + UDINT_TO_DINT(IN := #state.Trecv.length)) >= #Buffersize THEN
+	            // number of recieved bytes is greater than the set value number of bytes, adjust the constant "Buffersize"
+	            #state.status := W#16#0024;
+	        ELSE
+	            #retval."int" := MOVE_BLK_VARIANT(SRC := #recvData, COUNT := #state.Trecv.length, SRC_INDEX := 0, DEST_INDEX := #state.Trecv.recievedlength, DEST => #recvBuffer);
+	            #state.Trecv.recievedlength := #state.Trecv.recievedlength + UDINT_TO_DINT(IN := #state.Trecv.length);
+	            #recvData := #empty.Buffer;
+	        END_IF;
 	    END_IF;
 	    
-	    #TrecvTimeout(IN := (#state.step = 85) OR (#state.step = 86),
+	    // First 4 bytes are the MySQL header (3 bytes length, 1 byte sequence).
+	    // The greeting (step 10), login, ping, OK and ERR end at that first packet.
+	    // A SELECT stays open until the final EOF, otherwise step 10 would wait out the stall timer.
+	    IF #state.recieve AND (#state.Trecv.recievedlength >= 3) AND NOT #state.recieved THEN
+	        #counter := 0;
+	        "READ_FIXED_LENGTH_INT"(error => #retval."bool",
+	                                data := #recvBuffer,
+	                                start := #counter,
+	                                bytes := 3,
+	                                Dinteger => #state.Trecv.packetlength);
+	        #state.Trecv.packetlength := #state.Trecv.packetlength + 4;
+	        IF #state.Trecv.recievedlength >= #state.Trecv.packetlength THEN
+	            #column.counter := 4;
+	            #temp."byte" := #recvBuffer[#column.counter];
+	            // greeting, or any answer that is one packet: OK, ERR, LOCAL INFILE, auth switch
+	            #retval."bool" := (#state.step = 10) OR (NOT #query);
+	            IF (#temp."byte" = B#16#00) OR (#temp."byte" = B#16#FF) OR (#temp."byte" = B#16#FB) THEN
+	                #retval."bool" := TRUE;
+	            END_IF;
+	            IF (#temp."byte" = B#16#FE) AND (#state.Trecv.packetlength <> 9) THEN
+	                #retval."bool" := TRUE;
+	            END_IF;
+	            IF #retval."bool" THEN
+	                #state.recieved := TRUE;
+	            ELSE
+	                // phase: 0 column count, 1 column defs, 2 EOF after columns, 3 rows, 4 next result after MORE_RESULTS
+	                #temp."int" := 0;
+	                #temp.byte2 := B#16#0;
+	                #temp."bool" := FALSE;
+	                #querystatement.up := 0;
+	                WHILE (#querystatement.up < 2048) AND (NOT #temp."bool") DO
+	                    #querystatement.up := #querystatement.up + 1;
+	                    IF (#temp."int" + 4) > DINT_TO_INT(#state.Trecv.recievedlength) THEN
+	                        EXIT;
+	                    END_IF;
+	                    #retval."int" := #temp."int";
+	                    #column.counter := #retval."int";
+	                    #temp."dint" := BYTE_TO_DINT(#recvBuffer[#column.counter]);
+	                    #column.counter := #column.counter + 1;
+	                    #temp."dint" := #temp."dint" + (BYTE_TO_DINT(#recvBuffer[#column.counter]) * 256);
+	                    #column.counter := #column.counter + 1;
+	                    #temp."dint" := #temp."dint" + (BYTE_TO_DINT(#recvBuffer[#column.counter]) * 65536);
+	                    #querystatement.counter := INT_TO_DINT(#retval."int") + 4 + #temp."dint";
+	                    IF (#temp."dint" < 1) OR (#querystatement.counter > #state.Trecv.recievedlength) THEN
+	                        EXIT;
+	                    END_IF;
+	                    #column.counter := #retval."int" + 4;
+	                    #temp."byte" := #recvBuffer[#column.counter];
+	                    #column.counter := DINT_TO_INT(#querystatement.counter);
+	                    CASE BYTE_TO_INT(#temp.byte2) OF
+	                        0: // column count
+	                            IF #temp."byte" >= B#16#FB THEN
+	                                EXIT;
+	                            END_IF;
+	                            #sha1.counter := BYTE_TO_INT(#temp."byte");
+	                            #temp."int" := #column.counter;
+	                            IF #sha1.counter <= 0 THEN
+	                                IF NOT #capabilities.extended.DEPRECATE_EOF THEN
+	                                    #temp.byte2 := B#16#2;
+	                                ELSE
+	                                    #temp.byte2 := B#16#3;
+	                                END_IF;
+	                            ELSE
+	                                #temp.byte2 := B#16#1;
+	                            END_IF;
+	                        1: // column definition
+	                            #temp."int" := #column.counter;
+	                            #sha1.counter := #sha1.counter - 1;
+	                            IF #sha1.counter <= 0 THEN
+	                                IF NOT #capabilities.extended.DEPRECATE_EOF THEN
+	                                    #temp.byte2 := B#16#2;
+	                                ELSE
+	                                    #temp.byte2 := B#16#3;
+	                                END_IF;
+	                            END_IF;
+	                        2: // EOF after column definitions
+	                            IF (#temp."byte" = B#16#FE) AND (#temp."dint" < 9) THEN
+	                                #temp."int" := #column.counter;
+	                                #temp.byte2 := B#16#3;
+	                            ELSE
+	                                EXIT;
+	                            END_IF;
+	                        3: // row, terminating EOF, or error
+	                            IF (#temp."byte" = B#16#FE) AND (#temp."dint" < 9) THEN
+	                                #temp."word" := W#16#0000;
+	                                IF #temp."dint" >= 5 THEN
+	                                    #sha1.counter := #retval."int" + 7;
+	                                    #temp."dint" := BYTE_TO_DINT(#recvBuffer[#sha1.counter]);
+	                                    #sha1.counter := #sha1.counter + 1;
+	                                    #temp."dint" := #temp."dint" + (BYTE_TO_DINT(#recvBuffer[#sha1.counter]) * 256);
+	                                    #temp."word" := DINT_TO_WORD(#temp."dint");
+	                                END_IF;
+	                                #temp."int" := #column.counter;
+	                                // SERVER_MORE_RESULTS_EXISTS
+	                                IF (#temp."word" AND W#16#0008) <> W#16#0000 THEN
+	                                    #temp.byte2 := B#16#4;
+	                                ELSE
+	                                    #temp."bool" := TRUE;
+	                                END_IF;
+	                            ELSIF (#capabilities.extended.DEPRECATE_EOF) AND (#temp."byte" = B#16#FE) AND (#temp."dint" >= 9) THEN
+	                                #temp."word" := W#16#0000;
+	                                #sha1.counter := #retval."int" + 5;
+	                                #ip.count := 0;
+	                                WHILE #ip.count < 2 DO
+	                                    IF #sha1.counter >= #column.counter THEN
+	                                        EXIT;
+	                                    END_IF;
+	                                    IF #recvBuffer[#sha1.counter] < B#16#FB THEN
+	                                        #sha1.counter := #sha1.counter + 1;
+	                                    ELSIF #recvBuffer[#sha1.counter] = B#16#FC THEN
+	                                        #sha1.counter := #sha1.counter + 3;
+	                                    ELSIF #recvBuffer[#sha1.counter] = B#16#FD THEN
+	                                        #sha1.counter := #sha1.counter + 4;
+	                                    ELSE
+	                                        #sha1.counter := #sha1.counter + 9;
+	                                    END_IF;
+	                                    #ip.count := #ip.count + 1;
+	                                END_WHILE;
+	                                IF (#sha1.counter + 1) < #column.counter THEN
+	                                    #temp."dint" := BYTE_TO_DINT(#recvBuffer[#sha1.counter]);
+	                                    #sha1.counter := #sha1.counter + 1;
+	                                    #temp."dint" := #temp."dint" + (BYTE_TO_DINT(#recvBuffer[#sha1.counter]) * 256);
+	                                    #temp."word" := DINT_TO_WORD(#temp."dint");
+	                                END_IF;
+	                                #temp."int" := #column.counter;
+	                                IF (#temp."word" AND W#16#0008) <> W#16#0000 THEN
+	                                    #temp.byte2 := B#16#4;
+	                                ELSE
+	                                    #temp."bool" := TRUE;
+	                                END_IF;
+	                            ELSIF #temp."byte" = B#16#FF THEN
+	                                #temp."int" := #column.counter;
+	                                #temp."bool" := TRUE;
+	                            ELSE
+	                                // result row (an empty string starts with 0x00 and is not an OK packet)
+	                                #temp."int" := #column.counter;
+	                            END_IF;
+	                        4: // packet after MORE_RESULTS: another result set, or a final OK/ERR
+	                            IF (#temp."byte" = B#16#00) OR (#temp."byte" = B#16#FF) OR ((#temp."byte" = B#16#FE) AND (#temp."dint" >= 9)) THEN
+	                                #temp."word" := W#16#0000;
+	                                IF #temp."byte" <> B#16#FF THEN
+	                                    #sha1.counter := #retval."int" + 5;
+	                                    #ip.count := 0;
+	                                    WHILE #ip.count < 2 DO
+	                                        IF #sha1.counter >= #column.counter THEN
+	                                            EXIT;
+	                                        END_IF;
+	                                        IF #recvBuffer[#sha1.counter] < B#16#FB THEN
+	                                            #sha1.counter := #sha1.counter + 1;
+	                                        ELSIF #recvBuffer[#sha1.counter] = B#16#FC THEN
+	                                            #sha1.counter := #sha1.counter + 3;
+	                                        ELSIF #recvBuffer[#sha1.counter] = B#16#FD THEN
+	                                            #sha1.counter := #sha1.counter + 4;
+	                                        ELSE
+	                                            #sha1.counter := #sha1.counter + 9;
+	                                        END_IF;
+	                                        #ip.count := #ip.count + 1;
+	                                    END_WHILE;
+	                                    IF (#sha1.counter + 1) < #column.counter THEN
+	                                        #temp."dint" := BYTE_TO_DINT(#recvBuffer[#sha1.counter]);
+	                                        #sha1.counter := #sha1.counter + 1;
+	                                        #temp."dint" := #temp."dint" + (BYTE_TO_DINT(#recvBuffer[#sha1.counter]) * 256);
+	                                        #temp."word" := DINT_TO_WORD(#temp."dint");
+	                                    END_IF;
+	                                END_IF;
+	                                #temp."int" := #column.counter;
+	                                IF (#temp."byte" <> B#16#FF) AND ((#temp."word" AND W#16#0008) <> W#16#0000) THEN
+	                                    #temp.byte2 := B#16#4;
+	                                ELSE
+	                                    #temp."bool" := TRUE;
+	                                END_IF;
+	                            ELSE
+	                                // next result set: parse this same packet as the column count
+	                                #temp.byte2 := B#16#0;
+	                                #temp."int" := #retval."int";
+	                            END_IF;
+	                        ELSE
+	                            EXIT;
+	                    END_CASE;
+	                END_WHILE;
+	                IF #temp."bool" THEN
+	                    #state.recieved := TRUE;
+	                END_IF;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	    
+	    // 10s with no further bytes after the message has already started.
+	    // Length 0 does not start the timer: that is the server not having sent anything yet.
+	    #TrecvTimeout(IN := #state.recieve AND (#state.Trecv.recievedlength > 0) AND NOT #state.Trecv.newdata AND NOT #state.recieved,
 	                  PT := t#10s,
 	                  Q => #errTrecvTimeout);
 	    
@@ -564,23 +759,36 @@ BEGIN
 	        #state.status := W#16#0000;
 	    END_IF;
 	END_REGION
+	REGION Command while disconnected
+	    // query and ping are accepted only with a session. Drop the request and keep the code
+	    // until the next successful login or command. 16#0018 does not lock the sequencer.
+	    IF (#query OR #ping) AND NOT (#state.tcpConnected AND #state.serverConnected) THEN
+	        #state.status := W#16#0018;
+	        #query := FALSE;
+	        #ping := FALSE;
+	    END_IF;
+	END_REGION
 	REGION Write outputs 
 	    // write status
 	    #status := #state.status;
 	    // write connected
 	    #connected := #state.tcpConnected AND #state.serverConnected;
+	    // 16#0002 is only a TCP info. Every code from 16#0010 up is an error, including 16#0018.
+	    #error := #state.status >= W#16#0010;
 	END_REGION
 	REGION Not connected
 	    // reset sequencer if input connect is False or an error occurred
 	    IF NOT #connect THEN
 	        #state.step := 0;
-	        #state.status := W#16#0000;
+	        IF #state.status <> W#16#0018 THEN
+	            #state.status := W#16#0000;
+	        END_IF;
 	        #state.init := True;
 	    END_IF;
 	END_REGION
 	REGION Error
-	    // lock sequencer if error occurred
-	    IF #state.status >= W#16#0010 THEN
+	    // lock sequencer if error occurred. 16#0018 stays visible and does not drop the link.
+	    IF (#state.status >= W#16#0010) AND (#state.status <> W#16#0018) THEN
 	        #state.step := -1;
 	        #state.init := True;
 	    END_IF;
@@ -618,12 +826,18 @@ BEGIN
 	                    #state.step := 2;
 	                    // delete recieve buffer
 	                    #recvBuffer := #empty.Buffer;
+	                    #state.Trecv.recievedlength := 0;
+	                    #state.recieved := FALSE;
 	                END_IF;
 	            END_REGION
 	        002: // --> JUMP to 010, 020, 030
 	            REGION Wait for command
 	                // login command
 	                IF #state.login AND NOT #state.serverConnected THEN
+	                    #recvBuffer := #empty.Buffer;
+	                    #state.Trecv.recievedlength := 0;
+	                    #state.Trecv.packetlength := 0;
+	                    #state.recieved := FALSE;
 	                    #state.step := 10;
 	                END_IF;
 	                // ping command
@@ -647,11 +861,12 @@ BEGIN
 	            REGION Recieve server greeting
 	                // start recieving
 	                #state.recieve := True;
-	                IF #state.recieved THEN
+	                IF #errTrecvTimeout THEN
+	                    #state.status := W#16#0026;
+	                ELSIF #state.recieved THEN
 	                    #state.recieve := False;
 	                    #state.recieved := False;
 	                    #state.step := 11;
-	                    #state.Trecv.recievedlength := 0;
 	                END_IF;
 	            END_REGION
 	        011: // --> JUMP to 012
@@ -1110,6 +1325,11 @@ BEGIN
 	                                                start := #counter,
 	                                                bytes := LEN(#temp."string"),
 	                                                str := #temp."string");
+	                    IF #retval."bool" THEN
+	                        // SQL text does not fit in the send buffer
+	                        #state.status := W#16#0024;
+	                        EXIT;
+	                    END_IF;
 	                END_FOR;
 	                // calculate packet length (packet length = number of bytes - bytes(packet length data) - bytes(packet number data)
 	                #packetInfo.LENGTH := #counter - 4;
@@ -1139,8 +1359,9 @@ BEGIN
 	                    #state.step := 51;
 	                    // delete recieve buffer
 	                    #recvBuffer := #empty.Buffer;
-	                    // init recieved length info                    
+	                    // init recieved length info
 	                    #state.Trecv.recievedlength := 0;
+	                    #state.Trecv.packetlength := 0;
 	                    #state.recieved := false;
 	                END_IF;
 	            END_REGION
@@ -1148,7 +1369,9 @@ BEGIN
 	            REGION Recieve server answer
 	                // start recieving
 	                #state.recieve := True;
-	                IF #state.recieved THEN
+	                IF #errTrecvTimeout THEN
+	                    #state.status := W#16#0026;
+	                ELSIF #state.recieved THEN
 	                    #state.recieve := False;
 	                    #state.recieved := False;
 	                    #state.step := 52;
@@ -1197,7 +1420,7 @@ BEGIN
 	                    #state.step := 80;
 	                ELSE // RESULT packet or UNKNOWN packet
 	                    IF #query THEN // RESULT packet
-	                        #state.step := 85;
+	                        #state.step := 90;
 	                    ELSE // UNKNOWN packet
 	                        #state.status := W#16#0020;
 	                    END_IF;
@@ -1439,54 +1662,7 @@ BEGIN
 	                    END_IF;
 	                END_IF;
 	                #state.status := W#16#0012;
-	            END_REGION
-	        085: // --> JUMP TO 086, 090
-	            REGION Check received complete
-	                IF #state.Trecv.recievedlength >= 9 THEN
-	                    #counter := DINT_TO_INT(#state.Trecv.recievedlength) - 9;
-	                    // read packet size
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
-	                                            data := #recvBuffer,
-	                                            start := #counter,
-	                                            bytes := 3,
-	                                            Dinteger => #packetInfo.LENGTH);
-	                    // read packet number
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
-	                                            data := #recvBuffer,
-	                                            start := #counter,
-	                                            bytes := 1,
-	                                            Dinteger => #packetInfo.NUMBER);
-	                    // read packet header
-	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
-	                                            data := #recvBuffer,
-	                                            start := #counter,
-	                                            bytes := 1,
-	                                            Dinteger => #temp."dint");
-	                    #packetInfo.TYPE := DINT_TO_BYTE(#temp."dint");
-	                    // check packet type
-	                    IF #packetInfo.TYPE = B#16#fe AND #packetInfo.LENGTH = 5 AND NOT #capabilities.extended.DEPRECATE_EOF THEN
-	                        // received data is complete
-	                        #state.step := 90;
-	                    ELSE
-	                        // received data is not complete, wait for more data
-	                        #state.recieve := true;
-	                        #state.step := 86;
-	                    END_IF;
-	                END_IF;
-	            END_REGION
-	        086: // --> JUMP TO 085
-	            REGION Recieve more data
-	                // timeout recieving following data
-	                IF #errTrecvTimeout THEN
-	                    #state.status := w#16#0026;
-	                END_IF;
-	                // check, if new data recieved
-	                IF #state.recieved THEN
-	                    #state.recieve := false;
-	                    #state.recieved := false;
-	                    // check recieved data
-	                    #state.step := 85;
-	                END_IF;
+	                #query := FALSE;
 	            END_REGION
 	        090: // --> JUMP to 060, 070, 0100
 	            REGION Read RESULT packet
@@ -1565,11 +1741,12 @@ BEGIN
 	                                              data := #recvBuffer,
 	                                              start := #counter,
 	                                              Dinteger => #nColumns);
-	                #state.step := 80;
 	                // check if number of colums is bigger than max colums setting
 	                IF #nColumns > #Columns THEN
 	                    // number of colums in result data is greater than the set value number of columns, adjust the constant "Columns"
 	                    #state.status := W#16#0023;
+	                    // do not index resultData past Columns
+	                    #nColumns := 0;
 	                END_IF;
 	                // if capability flag CLIENT_CACHE_METADATA is set on server and client
 	                IF #capabilities.mariadb.CLIENT_CACHE_METADATA THEN
@@ -1706,7 +1883,10 @@ BEGIN
 	                            OUT => #serverInfo.STATUS);
 	                END_IF;
 	                // read row data until the next eof packet is found, this is indicated by a packet length of 5 and a header byte with B#16#fe
-	                WHILE #counter < #Buffersize DO
+	                WHILE (#state.status < W#16#0010) AND (#counter < DINT_TO_INT(#state.Trecv.recievedlength)) DO
+	                    IF (#counter + 4) > DINT_TO_INT(#state.Trecv.recievedlength) THEN
+	                        EXIT;
+	                    END_IF;
 	                    // read packet size
 	                    "READ_FIXED_LENGTH_INT"(error => #retval."bool",
 	                                            data := #recvBuffer,
@@ -1788,12 +1968,20 @@ BEGIN
 	                        END_FOR;
 	                    END_IF;
 	                END_WHILE;
+	                // EOF / OK / ERR not found: do not parse this buffer as an SQL error next scan
+	                IF (#state.step = 90) AND (#state.status < W#16#0010) THEN
+	                    #state.status := W#16#0026;
+	                END_IF;
 	            END_REGION
 	        100: // --> JUMP to 002
 	            REGION Server answer successfull
 	                // if login was active
 	                IF #state.login THEN
 	                    #state.serverConnected := True;
+	                END_IF;
+	                // command rejected while down is finished once a login or a command succeeds
+	                IF #state.status = W#16#0018 THEN
+	                    #state.status := W#16#0000;
 	                END_IF;
 	                // if ping was active
 	                IF #ping THEN
@@ -1806,6 +1994,10 @@ BEGIN
 	                #state.step := 2;
 	            END_REGION
 	    END_CASE;
+	    // Any real error drops the request in this scan. 16#0002 is only a TCP info.
+	    IF #state.status >= W#16#0010 THEN
+	        #query := FALSE;
+	    END_IF;
 	END_REGION
 END_FUNCTION_BLOCK
 

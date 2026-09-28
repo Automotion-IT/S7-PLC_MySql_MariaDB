@@ -16,6 +16,8 @@ You should create a new user for connecting to plc by typing following into your
     GRANT ALL PRIVILEGES ON your_databasename.your_tablename TO 'your_new_username'@'%';
     FLUSH PRIVILEGES;
 
+A remote client (the PLC, or any PC that is not localhost) can sit for about 10 seconds before the server sends the greeting. MySQL/MariaDB resolves the client IP with DNS first, and a failed lookup waits out `connect_timeout`. On the server set `skip_name_resolve=1` under `[mysqld]` and restart the service. Accounts then have to be `'user'@'%'` or `'user'@'192.168.x.x'`, not `'user'@'hostname'`.
+
 ![S7-PLC_MySql_MariaDB_Bild03](https://user-images.githubusercontent.com/10088323/134990587-494fd77e-f111-4fd2-b32c-3f1e69d1b739.JPG)
 
 * Tested with:
@@ -24,6 +26,7 @@ You should create a new user for connecting to plc by typing following into your
   * CPU 1214  DC/DC/DC FW: V4.6
   * CPU 1515-2PN FW: V2.6
   * CPU 1513-1PN FW: V2.9
+  * CPU 1508S FW: V31.1 (soft PLC over IPC BX-39A PN/IE)
   * Short PLC cycletimes (like 1ms) Will work, but you might have problems manually
     setting "query" to TRUE while debugging live in TIA-Portal (Siemens Software Issue)
         
@@ -73,6 +76,7 @@ connected|Output|Bool|false|connection established
 nColumns|Output|DInt|0|number of recieved columns
 nRows|Output|DInt|0|number of recieved rows
 resultData|Output|Array[1..#Columns, 0..#Rows] of String[#Stringsize]||resultdata: ResultData[1,0] = Columnname ResultData[1,1-X] = Rowdata
+error|Output|Bool|false|true when status is 16#0010 or higher
 ping|InOut|Bool|false|ping command, will automatically be reset
 query|InOut|Bool|false|query command, will automatically be reset
 querydata|InOut|Array[*] of String||query data / sql statement, multiple lines to make larger statements. Will be glued together as it is, remember to set your whitespaces as needed!
@@ -101,12 +105,13 @@ Stringsize|Constant|Int|50|max number of chars in resultstrings
                 3.    ALTER USER 'your_new_username'@'%' IDENTIFIED BY 'your_new_password';
                 4.    GRANT ALL PRIVILEGES ON your_databasename.your_tablename TO 'your_new_username'@'%';
                 5.    FLUSH PRIVILEGES;
+    W#16#0018:  Ping or query requested while the client is not connected. The request is cleared. The code stays until the next successful login or command and does not lock the connection.
     W#16#0020:  Wrong packet type recieved after login request, expectet OK or ERROR
     W#16#0021:  Recieved LOCALINFILE packet, but it is not implemented
     W#16#0023:  Number of colums in result data is greater than the set value number of columns, adjust the constant "Columns"
     W#16#0024:  Number of recieved bytes is greater than the set value number of bytes, adjust the constant "Buffersize"
     W#16#0025:  Number of rows in result data is greater than the set value number of rows, adjust the constant "Rows"
-    W#16#0026:  Timeout receiving data; missing correct footer that indicates the end of data transmission 
+    W#16#0026:  Timeout receiving data; server message incomplete (split TCP data, or missing end of the result) 
 
 ### Server status:
         IN_TRANS                    00000000 00000001
